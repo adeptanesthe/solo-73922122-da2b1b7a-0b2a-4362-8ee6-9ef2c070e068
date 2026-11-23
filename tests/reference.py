@@ -1,5 +1,6 @@
 """Reference implementations used to cross-check the production code."""
 
+from itertools import combinations_with_replacement
 from fractions import Fraction
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -61,3 +62,49 @@ def reference_queue(
         rows.append((panel_id, rate, rate * loss))
     rows.sort(key=lambda r: (-r[2], r[0]))
     return rows[:k]
+
+
+# ------------------------------------------------------------- audit oracle
+def brute_force_audit(
+    counts: Dict[int, Tuple[int, int]],
+    checks: Sequence[Tuple[int, int]],
+    grid_max: int = 100,
+) -> Fraction:
+    """Exact posterior probability by enumerating every monotone grid vector.
+
+    Independent of the production DP: it walks every non-decreasing tuple of
+    integer percentages (``combinations_with_replacement``), weights it with
+    the exact Bernoulli likelihood as a :class:`Fraction`, and sums the
+    weights that satisfy *all* caps after applying the left/lowest fallback.
+    Only usable for small component counts / grids (tests only).
+    """
+    if not counts:
+        raise ValueError("audit oracle requires at least one inspected score")
+
+    inspected = sorted(counts)
+    ordered_counts = [counts[s] for s in inspected]
+
+    def component_for(score: int) -> int:
+        left = [i for i, s in enumerate(inspected) if s <= score]
+        return left[-1] if left else 0
+
+    # Several queried scores may map to one component: keep the tightest cap,
+    # because all caps must hold simultaneously.
+    caps: Dict[int, int] = {}
+    for score, cap in checks:
+        component = component_for(score)
+        caps[component] = min(cap, caps.get(component, cap))
+
+    total = Fraction(0)
+    accepted = Fraction(0)
+    levels = range(grid_max + 1)
+    for vector in combinations_with_replacement(levels, len(inspected)):
+        weight = Fraction(1)
+        for level, (positives, totals) in zip(vector, ordered_counts):
+            rate = Fraction(level, grid_max)
+            weight *= rate**positives * (1 - rate) ** (totals - positives)
+        total += weight
+        if all(vector[component] <= cap for component, cap in caps.items()):
+            accepted += weight
+    assert total > 0
+    return accepted / total

@@ -3,14 +3,18 @@
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
+from .audit import InsufficientEvidence
 from .calibration import CalibrationMissing
 from .models import (
+    AuditRequest,
+    AuditResponse,
     InspectionSummary,
     InspectionUpdate,
     PanelBatch,
     QueueItem,
     QueueResponse,
     RegistrationSummary,
+    ResolvedCap,
 )
 from .store import MAX_QUEUE, NotFound, PanelStore, ValidationError
 
@@ -26,7 +30,7 @@ Rank glass panels for re-inspection by expected missed-defect loss.
   scanning the pending population.
 """
 
-app = FastAPI(title="Panel Re-inspection Ranking", version="1.0.0", description=description)
+app = FastAPI(title="Panel Re-inspection Ranking", version="1.1.0", description=description)
 store = PanelStore()
 
 
@@ -38,6 +42,17 @@ async def _missing_calibration(_request: Request, exc: CalibrationMissing) -> JS
             "detail": "calibration missing: no inspected panels yet; submit at "
             "least one inspection result before requesting a queue",
             "code": "calibration_missing",
+        },
+    )
+
+
+@app.exception_handler(InsufficientEvidence)
+async def _insufficient_evidence(_request: Request, exc: InsufficientEvidence) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": str(exc),
+            "code": "evidence_insufficient",
         },
     )
 
@@ -129,6 +144,40 @@ def calibration() -> dict:
             for score, rate in sorted(fitted.fitted_rates.items())
         ],
     }
+
+
+@app.post("/audit", response_model=AuditResponse)
+def audit_caps(request: AuditRequest) -> AuditResponse:
+    """Posterior probability that every defect-rate cap holds at once.
+
+    Each check names one distinct defect score (1..12 checks) and an integer
+    percentage upper bound.  Boards sharing a score share one rate and rates
+    live on the 0..100 integer grid; every non-decreasing rate vector has
+    equal prior weight and is updated by board-independent Bernoulli
+    likelihoods.  Scores without inspections follow the existing
+    left-nearest / lowest-score fallback.
+
+    Pass the ``calibration_version`` of the report you are verifying: if
+    inspections have since been added or corrected, ``recheck_required``
+    comes back true and a warning explains why.
+    """
+    checks = [(item.score, item.cap_percent) for item in request.checks]
+    snapshot = store.audit_caps(checks, request.calibration_version)
+    warnings: list[str] = []
+    if snapshot["recheck_required"]:
+        warnings.append(
+            f"calibration changed: requested version {request.calibration_version} "
+            f"is no longer current (live version {snapshot['calibration_version']}); "
+            "re-run the check against the new version"
+        )
+    return AuditResponse(
+        probability=snapshot["probability"],
+        calibration_version=snapshot["calibration_version"],
+        recheck_required=snapshot["recheck_required"],
+        warnings=warnings,
+        inspected_scores=snapshot["inspected_scores"],
+        resolved_checks=[ResolvedCap(**item) for item in snapshot["resolved_checks"]],
+    )
 
 
 @app.get("/panels/{panel_id}")

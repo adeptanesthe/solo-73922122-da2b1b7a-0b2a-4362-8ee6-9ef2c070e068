@@ -30,6 +30,7 @@ import threading
 from fractions import Fraction
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from .audit import InsufficientEvidence, posterior_cap_probability
 from .calibration import Calibration, CalibrationMissing, build_calibration
 
 MAX_PANELS = 50_000
@@ -261,6 +262,49 @@ class PanelStore:
                 "inspected_panels": self.inspected_panels,
                 "pending_panels": self.pending_panels,
                 "calibration_version": self.calibration_version,
+            }
+
+    def audit_caps(
+        self,
+        checks: List[Tuple[int, int]],
+        expected_version: Optional[int] = None,
+    ) -> dict:
+        """Posterior probability that every cap holds at once.
+
+        The counts and the calibration version are read under the same lock
+        that guards every inspection correction, so the probability always
+        reflects one coherent calibration even while results keep being
+        filled in or corrected.  ``expected_version`` lets a caller detect
+        that the calibration changed since their report was produced.
+        """
+        with self._lock:
+            if not self._counts:
+                raise InsufficientEvidence(
+                    "no inspected panels: cannot compute a posterior without evidence"
+                )
+            counts = {
+                score: (positives, total)
+                for score, (positives, total) in self._counts.items()
+            }
+            version = self.calibration_version
+            result = posterior_cap_probability(counts, checks, version)
+            recheck_required = (
+                expected_version is not None and expected_version != version
+            )
+            return {
+                "probability": result.probability,
+                "calibration_version": version,
+                "recheck_required": recheck_required,
+                "inspected_scores": list(result.inspected_scores),
+                "resolved_checks": [
+                    {
+                        "score": item.score,
+                        "cap_percent": item.cap_percent,
+                        "component_score": item.source_score,
+                        "source": item.source,
+                    }
+                    for item in result.constraints
+                ],
             }
 
     def _ranked(self, k: int) -> List[Tuple[int, int, Fraction, Fraction]]:
